@@ -10,6 +10,31 @@ import tempfile
 import shutil
 from config import *
 
+"""
+WELL Certification PDF Parser with Robust Scoring Rules
+
+Parsing Rules:
+1. Parse using robust regex that handles decimals and sums like 1+1, 0.5+1
+2. Format: code: A05.1, title: text, pts_attempted: number/number+number/No, 
+   status: Achieved|Not Attempted|Pending Documentation|Not Applicable, 
+   pts_achieved: optional number at end
+
+Scoring Logic:
+- "Pending Documentation" → write "Pending Documentation" (no score)
+- "Not Applicable" → write "Not Applicable" 
+- "Not Attempted" → write empty
+- "Achieved":
+  * If trailing pts_achieved exists → write that number (including 0, 0.5, 1+1→2)
+  * Else if pts_attempted is numeric → write that number
+  * Else → write "p"
+- Important: Keep 0 and decimals as numbers (0.5 stays 0.5, don't coerce to blank)
+
+Excel Writing:
+- Numeric values written as numbers (float(value)), not text
+- Text values (statuses, 'p') written as strings
+- Ensures proper Excel formatting and calculations
+"""
+
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
@@ -188,7 +213,13 @@ def create_combined_excel(results):
                 part_cols = cols_for_part_code(code)  # your existing function that finds all columns starting with this code
 
                 for c in part_cols:
-                    cell = ws.cell(row_idx, c, value)
+                    if isinstance(value, (int, float)):
+                        cell = ws.cell(row_idx, c, float(value))
+                    elif value in (None, ""):
+                        # leave cell empty
+                        continue
+                    else:
+                        cell = ws.cell(row_idx, c, value)
                     cell.alignment = CENTER  # (3) center values, including 'p' and text statuses
 
                 # (1) Only numeric Achieved contributes to Sub-Points
@@ -248,7 +279,8 @@ def parse_well_markdown(markdown_content):
             s2 = s.replace("β", "")
             s2 = re.sub(r"(\b[AWNLVTSXMCI]\d{2})\.\s+(\d)\b", r"\1.\2", s2)      # A01. 1 -> A01.1
             s2 = re.sub(r"(\d)\s*\.\s*(\d)", r"\1.\2", s2)                        # 0. 5 -> 0.5
-            s2 = re.sub(r"\s+", " ", s2)
+            # Only squeeze spaces/tabs, keep newlines for proper line-by-line parsing
+            s2 = re.sub(r'[ \t]+', ' ', s2)
             return s2
 
         text = norm(markdown_content)
@@ -257,8 +289,8 @@ def parse_well_markdown(markdown_content):
         text = text.replace("Pending Documentation & On-Site", "Pending Documentation")
         text = text.replace("Pending Documentation & On Site", "Pending Documentation")
 
-        # Normalize whitespace (collapse \n/multiple spaces) before regex parsing
-        text = re.sub(r'\s+', ' ', text)
+        # keep line breaks; only squeeze runs of spaces/tabs
+        text = re.sub(r'[ \t]+', ' ', text)
 
         # Basic fields - Accept 9–12 digits; keep leading zeros
         m = re.search(r"\b(\d{9,12})\b\s*-\s*([^-()]+?)(?=\s*\(WELL|\s*Date:|\s*WELL|\s*$)", text)
@@ -281,25 +313,95 @@ def parse_well_markdown(markdown_content):
             except Exception:
                 pass
 
-        # Parts (rules)
-        # Fix: change the part-line regex to anchor on the status word ("Achieved", "Not Applicable", "Pending…", etc.), 
-        # and allow anything (including commas, newlines, and digits) inside the title. This makes it robust to messy OCR.
-        PART_RE = re.compile(
-            r"(?P<code>[AWNLVTSXMCI]\d{2}\.\d)\s+"
-            r"(?P<title>.+?)\s+"                              # allow commas, newlines, digits
-            r"(?:(?P<pre>\d+(?:\.\d+)?)\s+)?"                 # optional number before status
-            r"(?P<status>Achieved|Not Attempted|Not Applicable|Withdrawn|"
-            r"Pending(?: Documentation)?|Pending Documentation)"
-            r"(?:\s+(?P<post>\d+(?:\.\d+)?))?",               # optional number after status
-            flags=re.IGNORECASE | re.DOTALL
+        # Parts (rules) - Using the robust regex pattern
+        # Matches:
+        #   CODE  TITLE  POINTS(or 'No')  STATUS  [ACHIEVED?]
+        ROW_RE = re.compile(
+            r"""^(?P<code>[A-Z][0-9]{2}\.\d)\s+
+                (?P<title>.+?)\s+
+                (?P<pts>(?:\d+(?:\.\d+)?(?:\+\d+(?:\.\d+)?)*)|No)\s+
+                (?P<status>Achieved|Not\s+Attempted|Pending\s+Documentation|Not\s+Applicable)
+                (?:\s+(?P<ach>(?:\d+(?:\.\d+)?(?:\+\d+(?:\.\d+)?)*)))?$""",
+            re.VERBOSE | re.MULTILINE
         )
 
+        def _sum_token(token: str):
+            """Convert '1+1' or '0.5+1' or '2' to a float sum; return None if token invalid or 'No'."""
+            if token is None:
+                return None
+            token = token.strip()
+            if token.lower() == 'no':
+                return None
+            parts = token.split('+')
+            try:
+                return sum(float(p) for p in parts)
+            except ValueError:
+                return None
+
+        def score_cell_from_line(line: str):
+            m = ROW_RE.match(line.strip())
+            if not m:
+                return None  # let caller ignore or log
+            
+            pts_attempted = m.group('pts')
+            status = m.group('status').replace('\xa0', ' ').strip()
+            pts_ach = m.group('ach')
+
+            attempted_val = _sum_token(pts_attempted)
+            achieved_val = _sum_token(pts_ach)
+
+            # Mapping according to the specified rules
+            if status == 'Pending Documentation':
+                return 'Pending Documentation'
+            if status == 'Not Applicable':
+                return 'Not Applicable'
+            if status == 'Not Attempted':
+                return None  # empty cell
+
+            # Achieved
+            if status == 'Achieved':
+                # Prefer explicit achieved value if present
+                if achieved_val is not None:
+                    return achieved_val  # includes 0 or 0.5 etc.
+                # Else fall back to attempted if numeric
+                if attempted_val is not None:
+                    return attempted_val
+                # Truly no numeric score → 'p'
+                return 'p'
+
+            # Fallback (shouldn't happen)
+            return None
+
+        # Parse parts using the new robust scoring logic
         parts = []
-        for m in PART_RE.finditer(text):
-            code   = m.group("code")
-            status = (m.group("status") or "").strip().title()
-            post   = m.group("post")
-            # Map to your rules
+
+        for m in ROW_RE.finditer(text):
+            line = m.group(0)
+            code = m.group('code')
+            value = score_cell_from_line(line)
+            if value is not None:
+                parts.append({"code": code, "value": value})
+
+        # Keep the old fallback, but also use finditer
+        found_codes = {p["code"] for p in parts}
+
+        PART_RE = re.compile(
+            r"(?P<code>[AWNLVTSXMCI]\d{2}\.\d)\s+"
+            r"(?P<title>.+?)\s+"
+            r"(?:(?P<pre>\d+(?:\.\d+)?)\s+)?"
+            r"(?P<status>Achieved|Not Attempted|Not Applicable|Withdrawn|"
+            r"Pending(?: Documentation)?|Pending Documentation)"
+            r"(?:\s+(?P<post>\d+(?:\.\d+)?))?",
+            flags=re.IGNORECASE | re.DOTALL | re.MULTILINE
+        )
+
+        for m_old in PART_RE.finditer(text):
+            code = m_old.group("code")
+            if code in found_codes:
+                continue
+            status = (m_old.group("status") or "").strip().title()
+            post = m_old.group("post")
+
             if status in ("Pending", "Pending Documentation"):
                 value = "Pending Documentation"
             elif status == "Not Applicable":
@@ -309,14 +411,16 @@ def parse_well_markdown(markdown_content):
             elif status == "Achieved":
                 if post is not None:
                     try:
-                        value = float(post)  # supports 0, 0.5, 1.5, etc.
+                        value = float(post)
                     except:
                         value = post
                 else:
                     value = "p"
             else:  # Not Attempted
-                value = ""
-            parts.append({"code": code, "value": value})
+                value = None   # truly empty
+
+            if value is not None:
+                parts.append({"code": code, "value": value})
 
         # We deliberately DO NOT compute totals here; create_combined_excel will compute Sub-Points, Total, and %.
 
