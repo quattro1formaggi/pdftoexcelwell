@@ -459,9 +459,9 @@
             </div>
             
             <div class="excel-info" id="excelInfo" style="display: none;">
-                <h3>📊 Combined Excel File Created!</h3>
-                <p>All PDF results have been combined into a single Excel file with each PDF as a row.</p>
-                <a href="/download-excel" class="download-excel-btn" id="downloadExcelBtn">Download Combined Excel File</a>
+                <h3>📊 WELL Certification Excel File Created!</h3>
+                <p>All PDF results have been parsed and combined into a WELL certification Excel file with proper concept columns, sub-points, and percentages.</p>
+                <a href="#" class="download-excel-btn" id="downloadExcelBtn" style="display: none;">Download WELL Certification Excel</a>
             </div>
             
             <div id="resultsContainer"></div>
@@ -606,6 +606,15 @@
                 }
 
                 results = data.results;
+                
+                // Store the Excel filename globally for download
+                if (data.excel_filename) {
+                    window.excelFilename = data.excel_filename;
+                    console.log('Excel filename received:', data.excel_filename);
+                } else {
+                    console.log('No excel_filename in response:', data);
+                }
+                
                 displayResults();
                 
                 // Clear selected files
@@ -629,6 +638,9 @@
             resultsSection.style.display = 'block';
             excelInfo.style.display = 'block';
             resultsContainer.innerHTML = '';
+
+            // Get the Excel filename from the global variable set during upload
+            let excelFilename = window.excelFilename;
 
             results.forEach(result => {
                 const resultItem = document.createElement('div');
@@ -659,6 +671,18 @@
                 
                 resultsContainer.appendChild(resultItem);
             });
+
+            // Update the download button with the correct filename
+            if (excelFilename) {
+                const downloadBtn = document.getElementById('downloadExcelBtn');
+                downloadBtn.href = `/download-excel?file=${encodeURIComponent(excelFilename)}`;
+                downloadBtn.style.display = 'inline-block';
+                console.log('Download button updated with filename:', excelFilename);
+            } else {
+                const downloadBtn = document.getElementById('downloadExcelBtn');
+                downloadBtn.style.display = 'none';
+                console.log('No Excel filename found, hiding download button');
+            }
         }
 
         // Simulate progress bar

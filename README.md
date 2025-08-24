@@ -1,16 +1,26 @@
-# PDF to Markdown & Excel Converter
+# 📄 PDF to WELL Certification Excel Converter
 
-A web application that allows bulk upload of PDF files, extracts the first 2 pages of each PDF, converts them to Markdown format using PyPDF2, and exports the results as Excel files.
+A Flask web application that processes PDF files to extract the first 2 pages, converts them to Markdown using PyPDF2, and creates a comprehensive WELL certification Excel file with proper concept parsing, sub-points calculation, and percentage analysis.
 
 ## ✨ Features
 
-- **Bulk PDF Upload**: Upload multiple PDF files simultaneously
-- **First Two Pages Extraction**: Automatically extracts the first 2 pages from each PDF
-- **Markdown Conversion**: Converts extracted pages to Markdown format using PyPDF2
-- **Excel Export**: Generates Excel files with structured data from the markdown content
-- **Modern Web Interface**: Beautiful, responsive UI with drag-and-drop functionality
-- **Real-time Processing**: Progress tracking and status updates
-- **File Management**: Review, remove, and manage selected files before processing
+- **Bulk PDF Upload**: Drag & drop multiple PDF files for processing
+- **First 2 Pages Extraction**: Extracts only the first 2 pages from each PDF
+- **PyPDF2 Conversion**: Reliable PDF to Markdown conversion using PyPDF2
+- **WELL Certification Parsing**: Advanced parsing logic for WELL building certification data
+- **Structured Excel Export**: Creates Excel files with:
+  - Concept columns (Air, Water, Nourishment, Light, Movement, Thermal Comfort, Sound, Materials, Mind, Community, Innovation)
+  - Sub-points calculation per concept
+  - Percentage analysis
+  - Individual part code tracking (A01.1, A01.2, etc.)
+  - Project metadata (Project ID, Name, Date Certified, Total Points)
+
+## 🏗️ Architecture
+
+- **Backend**: Flask web framework with PyPDF2 for PDF processing
+- **Frontend**: Modern HTML5/CSS3/JavaScript with drag & drop interface
+- **Excel Generation**: OpenPyXL for WELL certification Excel creation
+- **File Handling**: Secure file processing with automatic cleanup
 
 ## 🚀 Prerequisites
 
@@ -105,7 +115,7 @@ PDFconvert/
 
 - **GET /** - Main application interface
 - **POST /upload** - Handle PDF file uploads and processing
-- **GET /download-excel/<filename>** - Download generated Excel files
+- **GET /download-excel?file=<filename>** - Download generated Excel files using file parameter
 - **POST /clear-session** - Clear session data
 
 ## ⚙️ Configuration

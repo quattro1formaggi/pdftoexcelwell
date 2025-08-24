@@ -18,6 +18,9 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(PROCESSED_FOLDER, exist_ok=True)
 
+# Template path constant
+TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "template1.xlsx")  # put your real template here
+
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
@@ -61,7 +64,7 @@ def convert_to_markdown(pdf_path):
             
             for page_num, page in enumerate(pdf_reader.pages, 1):
                 text = page.extract_text()
-                if text.strip():
+                if text and text.strip():
                     markdown_content.append(f"## Page {page_num}\n")
                     markdown_content.append(text)
                     markdown_content.append("\n")
@@ -72,129 +75,261 @@ def convert_to_markdown(pdf_path):
         return None, f"Error converting to markdown: {str(e)}"
 
 def create_combined_excel(results):
-    """Create one Excel file with all PDF results as rows"""
+    """Create WELL certification Excel by writing into the REAL template (preserves merged headers)."""
     try:
-        # Create DataFrame for Excel export
-        excel_data = []
-        
-        for result in results:
-            if result['status'] == 'success':
-                # Extract basic info from filename
-                filename = result['filename']
-                file_size = os.path.getsize(os.path.join(UPLOAD_FOLDER, filename)) if os.path.exists(os.path.join(UPLOAD_FOLDER, filename)) else 0
-                
-                # Parse markdown content for structured data
-                parsed_data = parse_markdown_content(result['markdown'])
-                
-                # Combine all data
-                row_data = {
-                    'Filename': filename,
-                    'File Size (bytes)': file_size,
-                    'Processing Date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'Project ID': parsed_data.get('project_id', 'N/A'),
-                    'Project Name': parsed_data.get('project_name', 'N/A'),
-                    'Date Certified': parsed_data.get('date_cert', 'N/A'),
-                    'Total Points': parsed_data.get('total_points', 'N/A'),
-                    'Markdown Content': result['markdown'][:1000] + '...' if len(result['markdown']) > 1000 else result['markdown'],
-                    'Status': 'Success'
-                }
-                excel_data.append(row_data)
-            else:
-                # Handle failed conversions
-                row_data = {
-                    'Filename': result['filename'],
-                    'File Size (bytes)': 0,
-                    'Processing Date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'Project ID': 'N/A',
-                    'Project Name': 'N/A',
-                    'Date Certified': 'N/A',
-                    'Total Points': 'N/A',
-                    'Markdown Content': f"Error: {result['message']}",
-                    'Status': 'Failed'
-                }
-                excel_data.append(row_data)
-        
-        # Create DataFrame
-        df = pd.DataFrame(excel_data)
-        
-        # Generate Excel file
-        excel_path = os.path.join(PROCESSED_FOLDER, f"combined_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
-        
-        # Create Excel writer with formatting
-        with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
-            df.to_excel(writer, sheet_name='PDF Results', index=False)
-            
-            # Get the workbook and worksheet
-            workbook = writer.book
-            worksheet = writer.sheets['PDF Results']
-            
-            # Auto-adjust column widths
-            for column in worksheet.columns:
-                max_length = 0
-                column_letter = column[0].column_letter
-                for cell in column:
-                    try:
-                        if len(str(cell.value)) > max_length:
-                            max_length = len(str(cell.value))
-                    except:
-                        pass
-                adjusted_width = min(max_length + 2, 50)  # Cap at 50 characters
-                worksheet.column_dimensions[column_letter].width = adjusted_width
-        
-        return excel_path, None
-        
-    except Exception as e:
-        return None, f"Error creating combined Excel: {str(e)}"
+        if not results:
+            return None, "No results to process"
 
-def parse_markdown_content(markdown_content):
-    """Parse markdown content to extract structured data"""
+        # 1) Load the real template (do NOT rebuild headers/merges)
+        wb = load_workbook(TEMPLATE_PATH)
+        ws = wb.active
+
+        # 2) Build a 3-row header map so we can find exact columns
+        header_rows = [1, 2, 3]
+        max_col = ws.max_column
+        headers = []
+        for col in range(1, max_col + 1):
+            triple = tuple((ws.cell(r, col).value if ws.cell(r, col).value is not None else "") for r in header_rows)
+            headers.append(triple)
+
+        from openpyxl.styles import Alignment
+        from openpyxl.utils import column_index_from_string
+
+        # headers is your 3-row header list: [(row1,row2,row3), ...]
+
+        def col_for_concept_subpoints(letter, concept_name):
+            """Find 'Sub-Points' column by header (row3 == 'Sub-Points' and (row1 letter OR row2 name))."""
+            for i, t in enumerate(headers, start=1):
+                r1 = (str(t[0]).strip() if t[0] else "")
+                r2 = (str(t[1]).strip() if t[1] else "")
+                r3 = (str(t[2]).strip() if t[2] else "")
+                if r3 == "Sub-Points" and (r1 == letter or r2 == concept_name):
+                    return i
+            return None
+
+        def col_for_concept_pct(letter):
+            """Find the % column by header (row3 == '%' and row1 == letter)."""
+            for i, t in enumerate(headers, start=1):
+                r1 = (str(t[0]).strip() if t[0] else "")
+                r3 = (str(t[2]).strip() if t[2] else "")
+                if r3 == "%" and r1 == letter:
+                    return i
+            return None
+
+        # Optional fallback if header lookup ever fails (your sheet letters)
+        FALLBACK_SP_COLS = {"A":"AX","W":"BQ","N":"CL","L":"CZ","V":"DX","T":"EO","S":"FE","X":"GE","M":"HA","C":"IS","I":"JD"}
+        def sp_col_fallback(ws, letter):
+            try:
+                return column_index_from_string(FALLBACK_SP_COLS[letter])
+            except Exception:
+                return None
+
+        CENTER = Alignment(horizontal="center", vertical="center")
+
+        concept_letter_to_name = {
+            "A":"Air","W":"Water","N":"Nourishment","L":"Light","V":"Movement",
+            "T":"Thermal Comfort","S":"Sound","X":"Materials","M":"Mind","C":"Community","I":"Innovation"
+        }
+
+        def find_col(predicate):
+            for idx, triple in enumerate(headers, start=1):
+                if predicate(triple):
+                    return idx
+            return None
+
+        def col_for_project_field(name):
+            nm = name.strip()
+            return find_col(lambda t: any(isinstance(x, str) and x.strip() == nm for x in t))
+
+        def cols_for_part_code(code_prefix):
+            # 3rd row header starts with the code like 'A05.1'
+            cols = []
+            for idx, t in enumerate(headers, start=1):
+                third = t[2]
+                if isinstance(third, str) and third.startswith(code_prefix):
+                    cols.append(idx)
+            return cols
+
+
+
+        # 3) Find next empty data row (stay BELOW the merged header block)
+        row_idx = 4
+        while any(ws.cell(row_idx, j).value not in (None, "") for j in range(1, max_col + 1)):
+            row_idx += 1
+
+        processed = 0
+
+        for result in results:
+            if result.get("status") != "success":
+                continue
+
+            parsed = parse_well_markdown(result.get("markdown", ""))
+            if not parsed:
+                continue
+
+            # ---- Write basic project info
+            def set_field(field_name, value):
+                c = col_for_project_field(field_name)
+                if c is not None and value not in (None, ""):
+                    ws.cell(row_idx, c, value)
+
+            set_field("Project Name", parsed.get("project_name"))
+            set_field("Project ID", parsed.get("project_id"))
+            set_field("Date Certified", parsed.get("date_cert"))
+
+            # ---- Write parts with rules & accumulate subpoints
+            # Before the parts loop, start subpoints accumulator:
+            subpoints = {k: 0.0 for k in concept_letter_to_name}
+
+            # When writing each part value:
+            for part in parsed.get("parts", []):
+                code  = part.get("code", "")
+                value = part.get("value", "")
+                part_cols = cols_for_part_code(code)  # your existing function that finds all columns starting with this code
+
+                for c in part_cols:
+                    cell = ws.cell(row_idx, c, value)
+                    cell.alignment = CENTER  # (3) center values, including 'p' and text statuses
+
+                # (1) Only numeric Achieved contributes to Sub-Points
+                if isinstance(value, (int, float)):
+                    subpoints[code[0]] += float(value)
+
+            # ---- Sub-Points per concept
+            # (1) Write Sub-Points per concept, centered
+            total_points = 0.0
+            for letter, sp in subpoints.items():
+                cname = concept_letter_to_name[letter]
+                c_sp = col_for_concept_subpoints(letter, cname) or sp_col_fallback(ws, letter)
+                if c_sp:
+                    cell = ws.cell(row_idx, c_sp, round(sp, 3))
+                    cell.alignment = CENTER
+                total_points += sp
+
+            # Total Points = sum of Sub-Points, centered
+            c_total = col_for_project_field("Total Points")
+            if c_total:
+                cell = ws.cell(row_idx, c_total, round(total_points, 3))
+                cell.alignment = CENTER
+
+            # ---- Percentages (A..I): subpoints / total_points * 100
+            # (2) Percent columns with % sign, no decimals, centered
+            if total_points > 0:
+                for letter, sp in subpoints.items():
+                    c_pct = col_for_concept_pct(letter)
+                    if c_pct:
+                        frac = sp / total_points  # 0.0–1.0
+                        cell = ws.cell(row_idx, c_pct, frac)
+                        cell.number_format = "0%"   # shows % sign with no decimals
+                        cell.alignment = CENTER
+
+            processed += 1
+            row_idx += 1
+
+        if processed == 0:
+            # Still produce an empty copy of the template (helps debugging on the client)
+            out_name = f"well_certification_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            excel_path = os.path.join(PROCESSED_FOLDER, out_name)
+            wb.save(excel_path)
+            return excel_path, None
+
+        # 4) Save to processed folder
+        out_name = f"well_certification_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        excel_path = os.path.join(PROCESSED_FOLDER, out_name)
+        wb.save(excel_path)
+        return excel_path, None
+
+    except Exception as e:
+        return None, f"Error creating WELL certification Excel: {str(e)}"
+
+def parse_well_markdown(markdown_content):
     try:
-        # Normalize text
-        def normalize_text(s: str) -> str:
+        def norm(s: str) -> str:
             s2 = s.replace("β", "")
-            # Fix codes like "A01. 1" -> "A01.1"
-            s2 = re.sub(r"(\b[AWNLVTSXMCI]\d{2})\.\s+(\d)\b", r"\1.\2", s2)
-            # Fix spaced decimals like "0. 5", "1 . 5", "14. 5"
-            s2 = re.sub(r"(\d)\s*\.\s*(\d)", r"\1.\2", s2)
-            # Collapse whitespace
+            s2 = re.sub(r"(\b[AWNLVTSXMCI]\d{2})\.\s+(\d)\b", r"\1.\2", s2)      # A01. 1 -> A01.1
+            s2 = re.sub(r"(\d)\s*\.\s*(\d)", r"\1.\2", s2)                        # 0. 5 -> 0.5
             s2 = re.sub(r"\s+", " ", s2)
             return s2
+
+        text = norm(markdown_content)
         
-        text = normalize_text(markdown_content)
-        
-        # Extract header values
-        project_id_match = re.search(r"(\d{10})\s*-\s*", text)
-        project_id = project_id_match.group(1) if project_id_match else "Unknown"
-        
-        project_name_match = re.search(r"\d{10}\s*-\s*(.+?)\s*\(WELL", text)
-        project_name = project_name_match.group(1).strip() if project_name_match else "Unknown Project"
-        
-        date_match = re.search(r"Date:\s*(\d{1,2}\s+[A-Za-z]{3},\s*\d{4})", text)
+        # Handle OCR variations of "Pending Documentation & On-Site"
+        text = text.replace("Pending Documentation & On-Site", "Pending Documentation")
+        text = text.replace("Pending Documentation & On Site", "Pending Documentation")
+
+        # Normalize whitespace (collapse \n/multiple spaces) before regex parsing
+        text = re.sub(r'\s+', ' ', text)
+
+        # Basic fields - Accept 9–12 digits; keep leading zeros
+        m = re.search(r"\b(\d{9,12})\b\s*-\s*([^-()]+?)(?=\s*\(WELL|\s*Date:|\s*WELL|\s*$)", text)
+        if m:
+            project_id  = m.group(1)                # e.g., "02202255386"
+            project_name = m.group(2).strip()       # e.g., "SAP Labs China, Shanghai Campus"
+        else:
+            # Fallbacks if OCR is messy: try looser name grab after a long digit cluster
+            mid = re.search(r"\b(\d{9,12})\b\s*-\s*", text)
+            project_id = mid.group(1) if mid else "Unknown"
+            # Try to slice a reasonable name region
+            pname = re.search(r"\b\d{9,12}\b\s*-\s*(.*?)(?:\s*Date:|\s*WELL|\s*\(|$)", text)
+            project_name = pname.group(1).strip() if pname else "Unknown Project"
+
+        m_date = re.search(r"Date:\s*(\d{1,2}\s+[A-Za-z]{3},\s*\d{4})", text)
         date_cert = "Unknown"
-        if date_match:
+        if m_date:
             try:
-                date_cert = datetime.strptime(date_match.group(1).replace(",", ""), "%d %b %Y").strftime("%d/%m/%Y")
-            except:
-                date_cert = "Invalid Date"
-        
-        # Extract total points if available
-        tot_m = re.search(r"Reviewer\s*-\s*Confirmed Total Points\s*([0-9]+(?:\.\d+)?)", text, re.IGNORECASE)
-        total_points = tot_m.group(1) if tot_m else "N/A"
-        
+                date_cert = datetime.strptime(m_date.group(1).replace(",", ""), "%d %b %Y").strftime("%d/%m/%Y")
+            except Exception:
+                pass
+
+        # Parts (rules)
+        # Fix: change the part-line regex to anchor on the status word ("Achieved", "Not Applicable", "Pending…", etc.), 
+        # and allow anything (including commas, newlines, and digits) inside the title. This makes it robust to messy OCR.
+        PART_RE = re.compile(
+            r"(?P<code>[AWNLVTSXMCI]\d{2}\.\d)\s+"
+            r"(?P<title>.+?)\s+"                              # allow commas, newlines, digits
+            r"(?:(?P<pre>\d+(?:\.\d+)?)\s+)?"                 # optional number before status
+            r"(?P<status>Achieved|Not Attempted|Not Applicable|Withdrawn|"
+            r"Pending(?: Documentation)?|Pending Documentation)"
+            r"(?:\s+(?P<post>\d+(?:\.\d+)?))?",               # optional number after status
+            flags=re.IGNORECASE | re.DOTALL
+        )
+
+        parts = []
+        for m in PART_RE.finditer(text):
+            code   = m.group("code")
+            status = (m.group("status") or "").strip().title()
+            post   = m.group("post")
+            # Map to your rules
+            if status in ("Pending", "Pending Documentation"):
+                value = "Pending Documentation"
+            elif status == "Not Applicable":
+                value = "Not Applicable"
+            elif status == "Withdrawn":
+                value = "Withdrawn"
+            elif status == "Achieved":
+                if post is not None:
+                    try:
+                        value = float(post)  # supports 0, 0.5, 1.5, etc.
+                    except:
+                        value = post
+                else:
+                    value = "p"
+            else:  # Not Attempted
+                value = ""
+            parts.append({"code": code, "value": value})
+
+        # We deliberately DO NOT compute totals here; create_combined_excel will compute Sub-Points, Total, and %.
+
         return {
-            'project_id': project_id,
-            'project_name': project_name,
-            'date_cert': date_cert,
-            'total_points': total_points
+            "project_id": project_id,
+            "project_name": project_name,
+            "date_cert": date_cert,
+            "parts": parts
         }
-        
+
     except Exception as e:
-        return {
-            'project_id': 'Error',
-            'project_name': 'Error',
-            'date_cert': 'Error',
-            'total_points': 'Error'
-        }
+        print(f"Error parsing WELL markdown: {e}")
+        return None
 
 @app.route('/')
 def index():
@@ -202,102 +337,121 @@ def index():
 
 @app.route('/upload', methods=['POST'])
 def upload_files():
-    if 'files' not in request.files:
-        return jsonify({'error': 'No files provided'}), 400
-    
-    files = request.files.getlist('files')
-    if not files or all(file.filename == '' for file in files):
-        return jsonify({'error': 'No files selected'}), 400
-    
-    results = []
-    
-    for file in files:
-        if file and allowed_file(file.filename):
-            filename = secure_filename(file.filename)
-            file_path = os.path.join(UPLOAD_FOLDER, filename)
-            file.save(file_path)
-            
-            # Extract first 2 pages
-            first_two_pages_path, extract_error = extract_first_two_pages(file_path)
-            if extract_error:
+    try:
+        if 'files' not in request.files:
+            return jsonify({'error': 'No files provided'}), 400
+        
+        files = request.files.getlist('files')
+        if not files or all(file.filename == '' for file in files):
+            return jsonify({'error': 'No files selected'}), 400
+        
+        results = []
+        
+        for file in files:
+            if file and allowed_file(file.filename):
+                filename = secure_filename(file.filename)
+                file_path = os.path.join(UPLOAD_FOLDER, filename)
+                file.save(file_path)
+                
+                # Store file size before processing
+                file_size = os.path.getsize(file_path)
+                
+                # Extract first 2 pages
+                first_two_pages_path, extract_error = extract_first_two_pages(file_path)
+                if extract_error:
+                    results.append({
+                        'filename': filename,
+                        'status': 'error',
+                        'message': extract_error,
+                        'file_size': file_size
+                    })
+                    continue
+                
+                # Convert to markdown
+                markdown_content, convert_error = convert_to_markdown(first_two_pages_path)
+                if convert_error:
+                    results.append({
+                        'filename': filename,
+                        'status': 'error',
+                        'message': convert_error,
+                        'file_size': file_size
+                    })
+                    continue
+                
                 results.append({
                     'filename': filename,
-                    'status': 'error',
-                    'message': extract_error
+                    'status': 'success',
+                    'markdown': markdown_content,
+                    'message': 'Successfully processed',
+                    'file_size': file_size
                 })
-                continue
-            
-            # Convert to markdown
-            markdown_content, convert_error = convert_to_markdown(first_two_pages_path)
-            if convert_error:
-                results.append({
-                    'filename': filename,
-                    'status': 'error',
-                    'message': convert_error
-                })
-                continue
-            
-            results.append({
-                'filename': filename,
-                'status': 'success',
-                'markdown': markdown_content,
-                'message': 'Successfully processed'
-            })
-            
-            # Clean up temporary files
-            if os.path.exists(first_two_pages_path):
-                os.remove(first_two_pages_path)
-            if os.path.exists(file_path):
-                os.remove(file_path)
-    
-    # Create combined Excel file
-    excel_path, excel_error = create_combined_excel(results)
-    if excel_error:
-        return jsonify({'error': excel_error}), 500
-    
-    # Store results and Excel path in session
-    session['results'] = results
-    session['excel_path'] = excel_path
-    
-    return jsonify({
-        'results': results,
-        'excel_path': excel_path,
-        'message': f'Successfully processed {len(results)} files. Combined Excel file created.'
-    })
+                
+                # Clean up temporary files
+                if os.path.exists(first_two_pages_path):
+                    os.remove(first_two_pages_path)
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+        
+        # Create combined Excel file
+        excel_path, excel_error = create_combined_excel(results)
+        if excel_error:
+            return jsonify({'error': excel_error}), 500
+        
+        # Get just the filename for the client (avoid session storage)
+        excel_filename = os.path.basename(excel_path)
+        
+        print(f"Debug: Excel file created at: {excel_path}")
+        print(f"Debug: Excel filename: {excel_filename}")
+        
+        response_data = {
+            'results': results,
+            'excel_filename': excel_filename,
+            'message': f'Successfully processed {len(results)} files. Combined Excel file created.'
+        }
+        
+        print(f"Debug: Sending response to client: {response_data}")
+        
+        return jsonify(response_data)
+        
+    except Exception as e:
+        # Log the error for debugging
+        print(f"Upload error: {str(e)}")
+        return jsonify({'error': f'Unexpected error during processing: {str(e)}'}), 500
 
 @app.route('/download-excel')
 def download_excel():
-    """Download the combined Excel file"""
+    """Download the combined Excel file using file parameter"""
     try:
-        excel_path = session.get('excel_path')
-        if not excel_path or not os.path.exists(excel_path):
-            return jsonify({'error': 'Excel file not found. Please process files first.'}), 404
+        filename = request.args.get('file')
+        if not filename:
+            return jsonify({'error': 'Missing file parameter.'}), 400
         
-        # Get just the filename for download
-        filename = os.path.basename(excel_path)
+        # Security: only allow files inside PROCESSED_FOLDER
+        safe_name = os.path.basename(filename)
+        excel_path = os.path.join(PROCESSED_FOLDER, safe_name)
+        
+        print(f"Debug: Downloading file: {safe_name} from path: {excel_path}")
+        
+        if not os.path.exists(excel_path):
+            return jsonify({'error': f'Excel file not found: {safe_name}. Please process files first.'}), 404
         
         return send_file(
             excel_path, 
             as_attachment=True, 
-            download_name=filename,
+            download_name=safe_name,
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
         
     except Exception as e:
+        print(f"Download error: {str(e)}")
         return jsonify({'error': f'Error downloading file: {str(e)}'}), 500
 
 @app.route('/clear-session', methods=['POST'])
 def clear_session():
-    """Clear session and remove temporary files"""
+    """Clear session (kept for compatibility but simplified)"""
     try:
-        # Remove Excel file if it exists
-        excel_path = session.get('excel_path')
-        if excel_path and os.path.exists(excel_path):
-            os.remove(excel_path)
-        
         session.clear()
-        return jsonify({'message': 'Session cleared and files removed'})
-        
+        return jsonify({'message': 'Session cleared'})
     except Exception as e:
         return jsonify({'error': f'Error clearing session: {str(e)}'}), 500
 
